@@ -12,7 +12,7 @@ PipeWire video (and future audio) streaming addon for openFrameworks on Linux.
 
 ## Examples
 - `example-basic` publishes a generated video stream, shows capture, and lists nodes/ports.
-- `example-capture` capture-only example that targets the first available video node.
+- `example-capture` capture-only example that auto-targets a `Video/Source` node. Keys: `n`/`p` cycle targets, `r` refresh.
 
 ## Quick start
 1. Add the addon to your project.
