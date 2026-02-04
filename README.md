@@ -52,9 +52,10 @@ void ofApp::exit(){
 ```
 
 ## Notes
-- Current implementation uses RGBx format at the configured size and fps.
-- If you submit RGB or RGBA pixels, they are converted to RGBx.
-- If the input size doesn’t match the configured size, it is resized.
+- Format negotiation now advertises RGBx, BGRx, RGBA, and BGRA.
+- The negotiated size and stride are honored for publish and capture.
+- If you submit RGB or RGBA pixels, they are converted to the negotiated format.
+- If the input size doesn’t match the negotiated size, it is resized.
 
 ## Roadmap
 - Audio stream (capture + publish)

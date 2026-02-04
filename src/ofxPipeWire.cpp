@@ -36,6 +36,9 @@ bool ofxPipeWire::setup(bool enablePublish, bool enableCapture, const VideoConfi
     captureEnabled = enableCapture;
     videoConfig = config;
 
+    publishInfo = getDefaultVideoInfo();
+    captureInfo = getDefaultVideoInfo();
+
     if(!publishEnabled && !captureEnabled){
         ofLogWarning("ofxPipeWire") << "setup called with no streams enabled";
         return false;
@@ -110,8 +113,7 @@ bool ofxPipeWire::submitFrame(const ofPixels& pixels){
     }
 
     std::lock_guard<std::mutex> lock(publishMutex);
-    ensurePublishFormat(pixels);
-    convertToRGBx(pixels, publishFrame);
+    ensurePublishFormat(pixels, publishInfo.valid ? publishInfo : getDefaultVideoInfo());
     hasPublishFrame = true;
     return true;
 #else
@@ -207,11 +209,32 @@ spa_pod* ofxPipeWire::buildVideoFormat(spa_pod_builder& builder){
             SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
             SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video),
             SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
-            SPA_FORMAT_VIDEO_format, SPA_POD_Id(SPA_VIDEO_FORMAT_RGBx),
-            SPA_FORMAT_VIDEO_size, SPA_POD_Rectangle(videoConfig.width, videoConfig.height),
-            SPA_FORMAT_VIDEO_framerate, SPA_POD_Fraction(videoConfig.fps, 1)
+            SPA_FORMAT_VIDEO_format, SPA_POD_CHOICE_ENUM_Id(4,
+                SPA_VIDEO_FORMAT_RGBx,
+                SPA_VIDEO_FORMAT_RGBA,
+                SPA_VIDEO_FORMAT_BGRx,
+                SPA_VIDEO_FORMAT_BGRA),
+            SPA_FORMAT_VIDEO_size, SPA_POD_CHOICE_RANGE_Rectangle(
+                SPA_RECTANGLE(videoConfig.width, videoConfig.height),
+                SPA_RECTANGLE(16, 16),
+                SPA_RECTANGLE(8192, 8192)),
+            SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(
+                SPA_FRACTION(videoConfig.fps, 1),
+                SPA_FRACTION(1, 1),
+                SPA_FRACTION(240, 1))
         )
     );
+}
+
+ofxPipeWire::NegotiatedVideo ofxPipeWire::getDefaultVideoInfo() const{
+    NegotiatedVideo info;
+    info.width = videoConfig.width;
+    info.height = videoConfig.height;
+    info.fps = videoConfig.fps;
+    info.format = SPA_VIDEO_FORMAT_RGBx;
+    info.stride = static_cast<uint32_t>(videoConfig.width * 4);
+    info.valid = true;
+    return info;
 }
 
 bool ofxPipeWire::createPublishStream(){
@@ -230,13 +253,17 @@ bool ofxPipeWire::createPublishStream(){
         return false;
     }
 
+    publishListenerData.self = this;
+    publishListenerData.isPublish = true;
+
     static const pw_stream_events publishEvents = {
         PW_VERSION_STREAM_EVENTS,
         .state_changed = ofxPipeWire::onStreamStateChanged,
+        .param_changed = ofxPipeWire::onStreamParamChanged,
         .process = ofxPipeWire::onPublishProcess
     };
 
-    pw_stream_add_listener(publishStream, &publishListener, &publishEvents, this);
+    pw_stream_add_listener(publishStream, &publishListener, &publishEvents, &publishListenerData);
 
     uint8_t buffer[1024];
     spa_pod_builder builder = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
@@ -276,13 +303,17 @@ bool ofxPipeWire::createCaptureStream(){
         return false;
     }
 
+    captureListenerData.self = this;
+    captureListenerData.isPublish = false;
+
     static const pw_stream_events captureEvents = {
         PW_VERSION_STREAM_EVENTS,
         .state_changed = ofxPipeWire::onStreamStateChanged,
+        .param_changed = ofxPipeWire::onStreamParamChanged,
         .process = ofxPipeWire::onCaptureProcess
     };
 
-    pw_stream_add_listener(captureStream, &captureListener, &captureEvents, this);
+    pw_stream_add_listener(captureStream, &captureListener, &captureEvents, &captureListenerData);
 
     uint8_t buffer[1024];
     spa_pod_builder builder = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
@@ -319,7 +350,12 @@ void ofxPipeWire::onRegistryGlobal(void* data, uint32_t id, uint32_t permissions
 void ofxPipeWire::onStreamStateChanged(void* data, enum pw_stream_state oldState,
                                       enum pw_stream_state state, const char* error){
     (void)oldState;
-    ofxPipeWire* self = static_cast<ofxPipeWire*>(data);
+    StreamListenerData* listenerData = static_cast<StreamListenerData*>(data);
+    ofxPipeWire* self = listenerData ? listenerData->self : nullptr;
+    if(!self){
+        return;
+    }
+
     if(state == PW_STREAM_STATE_ERROR){
         ofLogError("ofxPipeWire") << "Stream error: " << (error ? error : "unknown");
     }
@@ -328,8 +364,28 @@ void ofxPipeWire::onStreamStateChanged(void* data, enum pw_stream_state oldState
     }
 }
 
+void ofxPipeWire::onStreamParamChanged(void* data, uint32_t id, const spa_pod* param){
+    if(id != SPA_PARAM_Format || param == nullptr){
+        return;
+    }
+
+    StreamListenerData* listenerData = static_cast<StreamListenerData*>(data);
+    ofxPipeWire* self = listenerData ? listenerData->self : nullptr;
+    if(!self){
+        return;
+    }
+
+    spa_video_info_raw info = {};
+    if(spa_format_video_raw_parse(param, &info) < 0){
+        return;
+    }
+
+    self->onVideoFormatChanged(listenerData->isPublish, info);
+}
+
 void ofxPipeWire::onPublishProcess(void* data){
-    ofxPipeWire* self = static_cast<ofxPipeWire*>(data);
+    StreamListenerData* listenerData = static_cast<StreamListenerData*>(data);
+    ofxPipeWire* self = listenerData ? listenerData->self : nullptr;
     if(!self || !self->publishStream){
         return;
     }
@@ -344,7 +400,8 @@ void ofxPipeWire::onPublishProcess(void* data){
 }
 
 void ofxPipeWire::onCaptureProcess(void* data){
-    ofxPipeWire* self = static_cast<ofxPipeWire*>(data);
+    StreamListenerData* listenerData = static_cast<StreamListenerData*>(data);
+    ofxPipeWire* self = listenerData ? listenerData->self : nullptr;
     if(!self || !self->captureStream){
         return;
     }
@@ -369,21 +426,16 @@ void ofxPipeWire::handleCaptureBuffer(pw_buffer* buffer){
         return;
     }
 
+    NegotiatedVideo info = captureInfo.valid ? captureInfo : getDefaultVideoInfo();
     const uint8_t* src = static_cast<const uint8_t*>(data->data) + data->chunk->offset;
     uint32_t stride = data->chunk->stride;
     if(stride == 0){
-        stride = static_cast<uint32_t>(videoConfig.width * 4);
+        stride = info.stride > 0 ? info.stride : static_cast<uint32_t>(info.width * 4);
     }
 
     std::lock_guard<std::mutex> lock(captureMutex);
-    latestFrame.allocate(videoConfig.width, videoConfig.height, OF_PIXELS_RGBA);
-
-    for(int y = 0; y < videoConfig.height; ++y){
-        const uint8_t* srcRow = src + y * stride;
-        uint8_t* dstRow = latestFrame.getData() + y * videoConfig.width * 4;
-        memcpy(dstRow, srcRow, videoConfig.width * 4);
-    }
-
+    latestFrame.allocate(info.width, info.height, OF_PIXELS_RGBA);
+    convertFromFormat(src, static_cast<int>(stride), latestFrame, info);
     hasLatestFrame = true;
 }
 
@@ -398,77 +450,181 @@ void ofxPipeWire::fillPublishBuffer(pw_buffer* buffer){
         return;
     }
 
+    NegotiatedVideo info = publishInfo.valid ? publishInfo : getDefaultVideoInfo();
     uint8_t* dst = static_cast<uint8_t*>(data->data) + data->chunk->offset;
     uint32_t stride = data->chunk->stride;
     if(stride == 0){
-        stride = static_cast<uint32_t>(videoConfig.width * 4);
+        stride = info.stride > 0 ? info.stride : static_cast<uint32_t>(info.width * 4);
     }
 
     std::lock_guard<std::mutex> lock(publishMutex);
     if(hasPublishFrame && publishFrame.isAllocated()){
-        for(int y = 0; y < videoConfig.height; ++y){
-            const uint8_t* srcRow = publishFrame.getData() + y * videoConfig.width * 4;
-            uint8_t* dstRow = dst + y * stride;
-            memcpy(dstRow, srcRow, videoConfig.width * 4);
-        }
+        convertToFormat(publishFrame, dst, static_cast<int>(stride), info);
     }else{
-        for(int y = 0; y < videoConfig.height; ++y){
-            memset(dst + y * stride, 0, videoConfig.width * 4);
+        for(int y = 0; y < info.height; ++y){
+            memset(dst + y * stride, 0, info.width * 4);
         }
     }
 
     data->chunk->offset = 0;
-    data->chunk->size = stride * videoConfig.height;
+    data->chunk->size = stride * info.height;
     data->chunk->stride = stride;
 }
 
-void ofxPipeWire::ensurePublishFormat(const ofPixels& pixels){
-    if(publishFrame.isAllocated() && publishFrame.getWidth() == videoConfig.width && publishFrame.getHeight() == videoConfig.height){
-        return;
+void ofxPipeWire::onVideoFormatChanged(bool isPublish, const spa_video_info_raw& info){
+    NegotiatedVideo negotiated;
+    negotiated.width = static_cast<int>(info.size.width);
+    negotiated.height = static_cast<int>(info.size.height);
+    negotiated.format = info.format;
+    negotiated.fps = 0;
+    if(info.framerate.denom > 0){
+        negotiated.fps = static_cast<int>(info.framerate.num / info.framerate.denom);
     }
-
-    if(pixels.getWidth() != videoConfig.width || pixels.getHeight() != videoConfig.height){
-        ofLogNotice("ofxPipeWire") << "Resizing input pixels to configured size";
+    negotiated.stride = info.stride[0];
+    if(negotiated.stride == 0){
+        negotiated.stride = static_cast<uint32_t>(negotiated.width * 4);
     }
+    negotiated.valid = true;
 
-    publishFrame.allocate(videoConfig.width, videoConfig.height, OF_PIXELS_RGBA);
+    if(isPublish){
+        publishInfo = negotiated;
+        ofLogNotice("ofxPipeWire") << "Publish format: " << negotiated.width << "x" << negotiated.height;
+    }else{
+        captureInfo = negotiated;
+        ofLogNotice("ofxPipeWire") << "Capture format: " << negotiated.width << "x" << negotiated.height;
+    }
 }
 
-void ofxPipeWire::convertToRGBx(const ofPixels& src, ofPixels& dst){
-    if(!dst.isAllocated()){
+void ofxPipeWire::ensurePublishFormat(const ofPixels& pixels, const NegotiatedVideo& info){
+    if(publishFrame.isAllocated() && publishFrame.getWidth() == info.width && publishFrame.getHeight() == info.height){
         return;
     }
 
-    if(src.getWidth() != videoConfig.width || src.getHeight() != videoConfig.height){
-        ofPixels scaled = src;
-        scaled.resize(videoConfig.width, videoConfig.height);
-        convertToRGBx(scaled, dst);
+    if(pixels.getWidth() != info.width || pixels.getHeight() != info.height){
+        ofLogNotice("ofxPipeWire") << "Resizing input pixels to negotiated size";
+    }
+
+    publishFrame.allocate(info.width, info.height, OF_PIXELS_RGBA);
+}
+
+void ofxPipeWire::convertToFormat(const ofPixels& src, uint8_t* dst, int dstStride, const NegotiatedVideo& info){
+    if(!dst || !src.isAllocated()){
         return;
     }
 
-    int channels = src.getNumChannels();
-    const uint8_t* srcData = src.getData();
-    uint8_t* dstData = dst.getData();
-
-    if(channels == 4){
-        memcpy(dstData, srcData, videoConfig.width * videoConfig.height * 4);
-        return;
+    ofPixels scaled = src;
+    if(src.getWidth() != info.width || src.getHeight() != info.height){
+        scaled.resize(info.width, info.height);
     }
 
-    if(channels == 3){
-        int pixels = videoConfig.width * videoConfig.height;
-        for(int i = 0; i < pixels; ++i){
-            int srcIndex = i * 3;
-            int dstIndex = i * 4;
-            dstData[dstIndex + 0] = srcData[srcIndex + 0];
-            dstData[dstIndex + 1] = srcData[srcIndex + 1];
-            dstData[dstIndex + 2] = srcData[srcIndex + 2];
-            dstData[dstIndex + 3] = 255;
+    const uint8_t* srcData = scaled.getData();
+    int w = info.width;
+    int h = info.height;
+
+    if(info.format == SPA_VIDEO_FORMAT_RGBA){
+        for(int y = 0; y < h; ++y){
+            memcpy(dst + y * dstStride, srcData + y * w * 4, w * 4);
         }
         return;
     }
 
-    ofLogWarning("ofxPipeWire") << "Unsupported pixel format, expected 3 or 4 channels";
+    for(int y = 0; y < h; ++y){
+        const uint8_t* srcRow = srcData + y * w * 4;
+        uint8_t* dstRow = dst + y * dstStride;
+        for(int x = 0; x < w; ++x){
+            const uint8_t r = srcRow[x * 4 + 0];
+            const uint8_t g = srcRow[x * 4 + 1];
+            const uint8_t b = srcRow[x * 4 + 2];
+            const uint8_t a = srcRow[x * 4 + 3];
+
+            switch(info.format){
+                case SPA_VIDEO_FORMAT_RGBx:
+                    dstRow[x * 4 + 0] = r;
+                    dstRow[x * 4 + 1] = g;
+                    dstRow[x * 4 + 2] = b;
+                    dstRow[x * 4 + 3] = 255;
+                    break;
+                case SPA_VIDEO_FORMAT_BGRx:
+                    dstRow[x * 4 + 0] = b;
+                    dstRow[x * 4 + 1] = g;
+                    dstRow[x * 4 + 2] = r;
+                    dstRow[x * 4 + 3] = 255;
+                    break;
+                case SPA_VIDEO_FORMAT_BGRA:
+                    dstRow[x * 4 + 0] = b;
+                    dstRow[x * 4 + 1] = g;
+                    dstRow[x * 4 + 2] = r;
+                    dstRow[x * 4 + 3] = a;
+                    break;
+                default:
+                    dstRow[x * 4 + 0] = r;
+                    dstRow[x * 4 + 1] = g;
+                    dstRow[x * 4 + 2] = b;
+                    dstRow[x * 4 + 3] = a;
+                    break;
+            }
+        }
+    }
+}
+
+void ofxPipeWire::convertFromFormat(const uint8_t* src, int srcStride, ofPixels& dst, const NegotiatedVideo& info){
+    if(!src || !dst.isAllocated()){
+        return;
+    }
+
+    int w = info.width;
+    int h = info.height;
+    uint8_t* dstData = dst.getData();
+
+    if(info.format == SPA_VIDEO_FORMAT_RGBA){
+        for(int y = 0; y < h; ++y){
+            memcpy(dstData + y * w * 4, src + y * srcStride, w * 4);
+        }
+        return;
+    }
+
+    for(int y = 0; y < h; ++y){
+        const uint8_t* srcRow = src + y * srcStride;
+        uint8_t* dstRow = dstData + y * w * 4;
+        for(int x = 0; x < w; ++x){
+            uint8_t r = 0;
+            uint8_t g = 0;
+            uint8_t b = 0;
+            uint8_t a = 255;
+
+            switch(info.format){
+                case SPA_VIDEO_FORMAT_RGBx:
+                    r = srcRow[x * 4 + 0];
+                    g = srcRow[x * 4 + 1];
+                    b = srcRow[x * 4 + 2];
+                    a = 255;
+                    break;
+                case SPA_VIDEO_FORMAT_BGRx:
+                    b = srcRow[x * 4 + 0];
+                    g = srcRow[x * 4 + 1];
+                    r = srcRow[x * 4 + 2];
+                    a = 255;
+                    break;
+                case SPA_VIDEO_FORMAT_BGRA:
+                    b = srcRow[x * 4 + 0];
+                    g = srcRow[x * 4 + 1];
+                    r = srcRow[x * 4 + 2];
+                    a = srcRow[x * 4 + 3];
+                    break;
+                default:
+                    r = srcRow[x * 4 + 0];
+                    g = srcRow[x * 4 + 1];
+                    b = srcRow[x * 4 + 2];
+                    a = srcRow[x * 4 + 3];
+                    break;
+            }
+
+            dstRow[x * 4 + 0] = r;
+            dstRow[x * 4 + 1] = g;
+            dstRow[x * 4 + 2] = b;
+            dstRow[x * 4 + 3] = a;
+        }
+    }
 }
 
 #endif
