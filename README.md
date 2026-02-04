@@ -28,6 +28,15 @@ void ofApp::setup(){
 
     pipewire.setAppName("ofApp");
     pipewire.setNodeName("ofxPipeWire Stream");
+
+    pipewire.setPreferredVideoFormats({
+        ofxPipeWire::VideoFormatPreference::RGBA,
+        ofxPipeWire::VideoFormatPreference::BGRA
+    });
+
+    // Optional: choose a specific capture target by name or serial
+    // pipewire.setCaptureTargetNodeName("OBS Studio");
+
     pipewire.setup(true, true, cfg);
 }
 
@@ -52,10 +61,16 @@ void ofApp::exit(){
 ```
 
 ## Notes
-- Format negotiation now advertises RGBx, BGRx, RGBA, and BGRA.
+- Format negotiation advertises RGBA, BGRA, RGBx, and BGRx in a preferred order.
 - The negotiated size and stride are honored for publish and capture.
 - If you submit RGB or RGBA pixels, they are converted to the negotiated format.
 - If the input size doesn’t match the negotiated size, it is resized.
+
+## Discovery
+- Use `getNodes()` or `getVideoNodes()` to list available PipeWire nodes.
+- Use `getPorts()` to list available ports with their directions and node IDs.
+- Use `setCaptureTargetNodeName`/`setCaptureTargetObjectSerial` to pin a capture target.
+- Use `setPublishTargetNodeName`/`setPublishTargetObjectSerial` to pin a publish target.
 
 ## Roadmap
 - Audio stream (capture + publish)

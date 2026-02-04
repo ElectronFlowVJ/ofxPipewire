@@ -1,5 +1,9 @@
 #include "ofxPipeWire.h"
 
+#include <algorithm>
+#include <cstdlib>
+#include <cstring>
+
 #ifdef TARGET_LINUX
 #include <spa/utils/defs.h>
 #endif
@@ -26,6 +30,98 @@ void ofxPipeWire::setNodeName(const std::string& name){
 #endif
 }
 
+void ofxPipeWire::setPreferredVideoFormats(const std::vector<VideoFormatPreference>& formats){
+#ifdef TARGET_LINUX
+    preferredFormats = formats;
+    if(preferredFormats.empty()){
+        preferredFormats = {VideoFormatPreference::RGBA, VideoFormatPreference::BGRA,
+                            VideoFormatPreference::RGBx, VideoFormatPreference::BGRx};
+    }
+    if(initialized){
+        ofLogNotice("ofxPipeWire") << "Preferred formats updated. Call shutdown/setup to renegotiate.";
+    }
+#else
+    (void)formats;
+#endif
+}
+
+void ofxPipeWire::setPublishTargetNodeName(const std::string& targetName){
+#ifdef TARGET_LINUX
+    publishTargetObject = targetName;
+    if(initialized){
+        ofLogNotice("ofxPipeWire") << "Publish target updated. Call shutdown/setup to reconnect.";
+    }
+#else
+    (void)targetName;
+#endif
+}
+
+void ofxPipeWire::setPublishTargetObjectSerial(const std::string& objectSerial){
+#ifdef TARGET_LINUX
+    publishTargetObject = objectSerial;
+    if(initialized){
+        ofLogNotice("ofxPipeWire") << "Publish target updated. Call shutdown/setup to reconnect.";
+    }
+#else
+    (void)objectSerial;
+#endif
+}
+
+void ofxPipeWire::setCaptureTargetNodeName(const std::string& targetName){
+#ifdef TARGET_LINUX
+    captureTargetObject = targetName;
+    if(initialized){
+        ofLogNotice("ofxPipeWire") << "Capture target updated. Call shutdown/setup to reconnect.";
+    }
+#else
+    (void)targetName;
+#endif
+}
+
+void ofxPipeWire::setCaptureTargetObjectSerial(const std::string& objectSerial){
+#ifdef TARGET_LINUX
+    captureTargetObject = objectSerial;
+    if(initialized){
+        ofLogNotice("ofxPipeWire") << "Capture target updated. Call shutdown/setup to reconnect.";
+    }
+#else
+    (void)objectSerial;
+#endif
+}
+
+std::vector<ofxPipeWire::NodeInfo> ofxPipeWire::getNodes() const{
+#ifdef TARGET_LINUX
+    std::lock_guard<std::mutex> lock(discoveryMutex);
+    return nodes;
+#else
+    return {};
+#endif
+}
+
+std::vector<ofxPipeWire::NodeInfo> ofxPipeWire::getVideoNodes() const{
+#ifdef TARGET_LINUX
+    std::lock_guard<std::mutex> lock(discoveryMutex);
+    std::vector<NodeInfo> result;
+    for(const auto& node : nodes){
+        if(isVideoNode(node)){
+            result.push_back(node);
+        }
+    }
+    return result;
+#else
+    return {};
+#endif
+}
+
+std::vector<ofxPipeWire::PortInfo> ofxPipeWire::getPorts() const{
+#ifdef TARGET_LINUX
+    std::lock_guard<std::mutex> lock(discoveryMutex);
+    return ports;
+#else
+    return {};
+#endif
+}
+
 bool ofxPipeWire::setup(bool enablePublish, bool enableCapture, const VideoConfig& config){
 #ifdef TARGET_LINUX
     if(initialized){
@@ -35,6 +131,11 @@ bool ofxPipeWire::setup(bool enablePublish, bool enableCapture, const VideoConfi
     publishEnabled = enablePublish;
     captureEnabled = enableCapture;
     videoConfig = config;
+
+    if(preferredFormats.empty()){
+        preferredFormats = {VideoFormatPreference::RGBA, VideoFormatPreference::BGRA,
+                            VideoFormatPreference::RGBx, VideoFormatPreference::BGRx};
+    }
 
     publishInfo = getDefaultVideoInfo();
     captureInfo = getDefaultVideoInfo();
@@ -172,7 +273,8 @@ bool ofxPipeWire::setupPipeWire(){
 
     static const pw_registry_events registryEvents = {
         PW_VERSION_REGISTRY_EVENTS,
-        .global = ofxPipeWire::onRegistryGlobal
+        .global = ofxPipeWire::onRegistryGlobal,
+        .global_remove = ofxPipeWire::onRegistryGlobalRemove
     };
 
     pw_registry_add_listener(registry, &registryListener, &registryEvents, this);
@@ -204,16 +306,39 @@ void ofxPipeWire::teardownPipeWire(){
 }
 
 spa_pod* ofxPipeWire::buildVideoFormat(spa_pod_builder& builder){
+    spa_video_format formats[4] = {
+        SPA_VIDEO_FORMAT_RGBA,
+        SPA_VIDEO_FORMAT_BGRA,
+        SPA_VIDEO_FORMAT_RGBx,
+        SPA_VIDEO_FORMAT_BGRx
+    };
+
+    if(!preferredFormats.empty()){
+        std::vector<spa_video_format> ordered;
+        ordered.reserve(4);
+        for(const auto& pref : preferredFormats){
+            spa_video_format fmt = toSpaFormat(pref);
+            if(std::find(ordered.begin(), ordered.end(), fmt) == ordered.end()){
+                ordered.push_back(fmt);
+            }
+        }
+        for(const auto& fallback : formats){
+            if(std::find(ordered.begin(), ordered.end(), fallback) == ordered.end()){
+                ordered.push_back(fallback);
+            }
+        }
+        for(size_t i = 0; i < 4 && i < ordered.size(); ++i){
+            formats[i] = ordered[i];
+        }
+    }
+
     return reinterpret_cast<spa_pod*>(
         spa_pod_builder_add_object(&builder,
             SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
             SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video),
             SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
             SPA_FORMAT_VIDEO_format, SPA_POD_CHOICE_ENUM_Id(4,
-                SPA_VIDEO_FORMAT_RGBx,
-                SPA_VIDEO_FORMAT_RGBA,
-                SPA_VIDEO_FORMAT_BGRx,
-                SPA_VIDEO_FORMAT_BGRA),
+                formats[0], formats[1], formats[2], formats[3]),
             SPA_FORMAT_VIDEO_size, SPA_POD_CHOICE_RANGE_Rectangle(
                 SPA_RECTANGLE(videoConfig.width, videoConfig.height),
                 SPA_RECTANGLE(16, 16),
@@ -231,7 +356,11 @@ ofxPipeWire::NegotiatedVideo ofxPipeWire::getDefaultVideoInfo() const{
     info.width = videoConfig.width;
     info.height = videoConfig.height;
     info.fps = videoConfig.fps;
-    info.format = SPA_VIDEO_FORMAT_RGBx;
+    if(!preferredFormats.empty()){
+        info.format = toSpaFormat(preferredFormats.front());
+    }else{
+        info.format = SPA_VIDEO_FORMAT_RGBx;
+    }
     info.stride = static_cast<uint32_t>(videoConfig.width * 4);
     info.valid = true;
     return info;
@@ -246,6 +375,10 @@ bool ofxPipeWire::createPublishStream(){
         PW_KEY_NODE_NAME, nodeName.c_str(),
         nullptr
     );
+
+    if(!publishTargetObject.empty()){
+        pw_properties_set(props, PW_KEY_TARGET_OBJECT, publishTargetObject.c_str());
+    }
 
     publishStream = pw_stream_new(core, "ofxPipeWire Publish", props);
     if(!publishStream){
@@ -297,6 +430,10 @@ bool ofxPipeWire::createCaptureStream(){
         nullptr
     );
 
+    if(!captureTargetObject.empty()){
+        pw_properties_set(props, PW_KEY_TARGET_OBJECT, captureTargetObject.c_str());
+    }
+
     captureStream = pw_stream_new(core, "ofxPipeWire Capture", props);
     if(!captureStream){
         ofLogError("ofxPipeWire") << "Failed to create capture stream";
@@ -339,12 +476,26 @@ bool ofxPipeWire::createCaptureStream(){
 
 void ofxPipeWire::onRegistryGlobal(void* data, uint32_t id, uint32_t permissions,
                                   const char* type, uint32_t version, const spa_dict* props){
-    (void)data;
-    (void)id;
     (void)permissions;
-    (void)type;
     (void)version;
-    (void)props;
+    ofxPipeWire* self = static_cast<ofxPipeWire*>(data);
+    if(!self || !type){
+        return;
+    }
+
+    if(strcmp(type, PW_TYPE_INTERFACE_Node) == 0){
+        self->addNodeInfo(id, props);
+    }else if(strcmp(type, PW_TYPE_INTERFACE_Port) == 0){
+        self->addPortInfo(id, props);
+    }
+}
+
+void ofxPipeWire::onRegistryGlobalRemove(void* data, uint32_t id){
+    ofxPipeWire* self = static_cast<ofxPipeWire*>(data);
+    if(!self){
+        return;
+    }
+    self->removeObject(id);
 }
 
 void ofxPipeWire::onStreamStateChanged(void* data, enum pw_stream_state oldState,
@@ -624,6 +775,107 @@ void ofxPipeWire::convertFromFormat(const uint8_t* src, int srcStride, ofPixels&
             dstRow[x * 4 + 2] = b;
             dstRow[x * 4 + 3] = a;
         }
+    }
+}
+
+void ofxPipeWire::addNodeInfo(uint32_t id, const spa_dict* props){
+    if(!props){
+        return;
+    }
+
+    NodeInfo info;
+    info.id = id;
+    if(const char* value = spa_dict_lookup(props, PW_KEY_NODE_NAME)){
+        info.name = value;
+    }
+    if(const char* value = spa_dict_lookup(props, PW_KEY_NODE_DESCRIPTION)){
+        info.description = value;
+    }
+    if(const char* value = spa_dict_lookup(props, PW_KEY_MEDIA_CLASS)){
+        info.mediaClass = value;
+    }
+    if(const char* value = spa_dict_lookup(props, PW_KEY_OBJECT_SERIAL)){
+        info.objectSerial = value;
+    }
+
+    std::lock_guard<std::mutex> lock(discoveryMutex);
+    auto it = std::find_if(nodes.begin(), nodes.end(), [id](const NodeInfo& node){
+        return node.id == id;
+    });
+    if(it != nodes.end()){
+        *it = info;
+    }else{
+        nodes.push_back(info);
+    }
+}
+
+void ofxPipeWire::addPortInfo(uint32_t id, const spa_dict* props){
+    if(!props){
+        return;
+    }
+
+    PortInfo info;
+    info.id = id;
+    if(const char* value = spa_dict_lookup(props, PW_KEY_PORT_NAME)){
+        info.name = value;
+    }
+    if(const char* value = spa_dict_lookup(props, PW_KEY_PORT_DIRECTION)){
+        info.direction = value;
+    }
+    if(const char* value = spa_dict_lookup(props, PW_KEY_PORT_ALIAS)){
+        info.alias = value;
+    }
+    if(const char* value = spa_dict_lookup(props, PW_KEY_NODE_ID)){
+        info.nodeId = parseUint32(value);
+    }
+
+    std::lock_guard<std::mutex> lock(discoveryMutex);
+    auto it = std::find_if(ports.begin(), ports.end(), [id](const PortInfo& port){
+        return port.id == id;
+    });
+    if(it != ports.end()){
+        *it = info;
+    }else{
+        ports.push_back(info);
+    }
+}
+
+void ofxPipeWire::removeObject(uint32_t id){
+    std::lock_guard<std::mutex> lock(discoveryMutex);
+    nodes.erase(std::remove_if(nodes.begin(), nodes.end(), [id](const NodeInfo& node){
+        return node.id == id;
+    }), nodes.end());
+    ports.erase(std::remove_if(ports.begin(), ports.end(), [id](const PortInfo& port){
+        return port.id == id;
+    }), ports.end());
+}
+
+bool ofxPipeWire::isVideoNode(const NodeInfo& node) const{
+    if(node.mediaClass.empty()){
+        return false;
+    }
+    return node.mediaClass.find("Video") != std::string::npos;
+}
+
+uint32_t ofxPipeWire::parseUint32(const char* value){
+    if(!value){
+        return 0;
+    }
+    return static_cast<uint32_t>(strtoul(value, nullptr, 10));
+}
+
+spa_video_format ofxPipeWire::toSpaFormat(VideoFormatPreference format){
+    switch(format){
+        case VideoFormatPreference::RGBA:
+            return SPA_VIDEO_FORMAT_RGBA;
+        case VideoFormatPreference::BGRA:
+            return SPA_VIDEO_FORMAT_BGRA;
+        case VideoFormatPreference::RGBx:
+            return SPA_VIDEO_FORMAT_RGBx;
+        case VideoFormatPreference::BGRx:
+            return SPA_VIDEO_FORMAT_BGRx;
+        default:
+            return SPA_VIDEO_FORMAT_RGBx;
     }
 }
 
