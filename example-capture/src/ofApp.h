@@ -11,21 +11,16 @@ public:
     void exit();
 
 private:
-    void generatePublishFrame();
-    std::string formatNodeLine(const ofxPipeWire::NodeInfo& node) const;
-    std::string formatPortLine(const ofxPipeWire::PortInfo& port) const;
+    void pickFirstVideoNode();
 
     ofxPipeWire pipewire;
     ofxPipeWire::VideoConfig config;
 
-    ofPixels publishPixels;
     ofPixels capturedPixels;
-
-    ofTexture publishTex;
     ofTexture captureTex;
 
-    float timeStart = 0.0f;
+    std::string targetName;
+    std::string status;
     bool pipewireReady = false;
-
-    int maxListCount = 12;
+    bool targetSelected = false;
 };

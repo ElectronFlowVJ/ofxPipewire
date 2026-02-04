@@ -1,6 +1,7 @@
 #include "ofApp.h"
 
 #include <cmath>
+#include <sstream>
 
 void ofApp::setup(){
     ofSetVerticalSync(true);
@@ -62,8 +63,36 @@ void ofApp::draw(){
     ofDrawBitmapStringHighlight("Publish", 20, 20 + h + 20);
     ofDrawBitmapStringHighlight("Capture", 40 + w, 20 + h + 20);
 
+    float listTop = 20.0f + h + 60.0f;
+    ofDrawBitmapStringHighlight("Video Nodes (first " + ofToString(maxListCount) + ")", 20, listTop);
+
+    auto nodes = pipewire.getVideoNodes();
+    float y = listTop + 18.0f;
+    int count = 0;
+    for(const auto& node : nodes){
+        ofDrawBitmapString(formatNodeLine(node), 20, y);
+        y += 14.0f;
+        if(++count >= maxListCount){
+            break;
+        }
+    }
+
+    y += 10.0f;
+    ofDrawBitmapStringHighlight("Ports (first " + ofToString(maxListCount) + ")", 20, y);
+    y += 18.0f;
+
+    auto ports = pipewire.getPorts();
+    count = 0;
+    for(const auto& port : ports){
+        ofDrawBitmapString(formatPortLine(port), 20, y);
+        y += 14.0f;
+        if(++count >= maxListCount){
+            break;
+        }
+    }
+
     if(!pipewireReady){
-        ofDrawBitmapStringHighlight("PipeWire not initialized (Linux only)", 20, 20 + h + 50);
+        ofDrawBitmapStringHighlight("PipeWire not initialized (Linux only)", 20, y + 20);
     }
 }
 
@@ -98,4 +127,22 @@ void ofApp::generatePublishFrame(){
             data[i + 3] = 255;
         }
     }
+}
+
+std::string ofApp::formatNodeLine(const ofxPipeWire::NodeInfo& node) const{
+    std::ostringstream oss;
+    oss << "#" << node.id << " " << node.name;
+    if(!node.mediaClass.empty()){
+        oss << " (" << node.mediaClass << ")";
+    }
+    return oss.str();
+}
+
+std::string ofApp::formatPortLine(const ofxPipeWire::PortInfo& port) const{
+    std::ostringstream oss;
+    oss << "#" << port.id << " node " << port.nodeId << " " << port.direction << " " << port.name;
+    if(!port.alias.empty()){
+        oss << " alias " << port.alias;
+    }
+    return oss.str();
 }

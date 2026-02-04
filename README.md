@@ -11,7 +11,8 @@ PipeWire video (and future audio) streaming addon for openFrameworks on Linux.
 - `libpipewire-0.3` development package available via `pkg-config`
 
 ## Examples
-- `example-basic` publishes a generated video stream and displays the captured stream side-by-side.
+- `example-basic` publishes a generated video stream, shows capture, and lists nodes/ports.
+- `example-capture` capture-only example that targets the first available video node.
 
 ## Quick start
 1. Add the addon to your project.
